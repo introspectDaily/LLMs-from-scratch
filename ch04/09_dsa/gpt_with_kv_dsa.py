@@ -182,7 +182,6 @@ class MultiHeadAttentionWithDSA(nn.Module):
         ####################################################
         # KV cache-related
         if use_cache:
-            old_len = 0 if self.cache_k is None else self.cache_k.size(1)
             if self.cache_k is None:
                 keys = keys_new
                 values = values_new
