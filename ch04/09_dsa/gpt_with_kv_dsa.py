@@ -24,11 +24,13 @@ import torch.nn as nn
 #####################################
 # DSA combines two components:
 #   1. A Lightning Indexer that scores all past tokens for each query
-#      using a lightweight sum of ReLU(q · k) dot products.
+#      using a lightweight gated sum of ReLU(q · k) dot products.
 #   2. A Token Selector that picks the top-K highest-scoring past tokens
-#      and masks out the rest, reducing effective context from O(L) to O(k).
+#      and masks out the rest.
 #
-# This reduces attention complexity from O(L²) to O(L·k).
+# This teaching implementation applies a dense mask to standard attention.
+# It reproduces the DSA selection logic but does not include a fused sparse
+# attention kernel that would reduce attention compute from O(L^2) to O(L*k).
 #
 # Reference implementation inspired by:
 #   https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py
@@ -37,11 +39,13 @@ import torch.nn as nn
 class LightningIndexer(nn.Module):
     """Lightweight module that scores every past token for each incoming query.
 
-    For each query token t and each candidate past token s, the score is:
-        I_{t,s} = sum_j [ w_{t,j} * ReLU(q_{t,j} · k_s) ]
+    For each query token t and each candidate past token s, the score is a
+    gated sum of per-head dot products:
+        I_{t,s} = sum_j [ (w_{t,j} / sqrt(H_I)) * ReLU((q_{t,j} · k_s) / sqrt(d_I)) ]
 
     where w_{t,j} is a learned per-head scalar weight derived from the input,
-    and j indexes over the index heads.
+    H_I is the number of index heads, d_I is the index head dimension, and j
+    indexes over the index heads.
 
     Args:
         d_model:       model dimension (same as emb_dim).
@@ -84,9 +88,11 @@ class LightningIndexer(nn.Module):
         raw = torch.einsum("bthd,bsd->bths", q, k) * self.scale  # (b, T, H_I, S)
         raw = torch.relu(raw)
 
-        # Per-head learned weights: (b, T, H_I)
+        # Per-head learned gates: (b, T, H_I)
+        # Reference implementations use raw learned gates scaled by sqrt(H_I),
+        # not a probability distribution over index heads.
         w = self.W_weights(x)  # (b, T, H_I)
-        w = w.softmax(dim=-1)  # normalise across heads
+        w = w * (self.index_n_heads ** -0.5)
 
         # Weighted sum over heads -> index scores (b, T, S)
         index_scores = torch.einsum("bth,bths->bts", w, raw)  # (b, T, S)
@@ -105,8 +111,8 @@ class MultiHeadAttentionWithDSA(nn.Module):
 
     After computing full attention scores, the Lightning Indexer selects the
     top-K most relevant past tokens for each query, and all other positions
-    are masked to -inf before softmax.  This makes the effective attention
-    cost O(L·k) instead of O(L²).
+    are masked to -inf before softmax. This keeps the selected-token behavior
+    of DSA while using a dense attention matrix for clarity.
 
     Args:
         d_in:           input dimension.

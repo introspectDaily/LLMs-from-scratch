@@ -1,21 +1,26 @@
-"""
-Verification tests for the DeepSeek Sparse Attention (DSA) implementation.
+import os
 
-Run with:
-    python test_dsa.py
-"""
-
-import sys
+import pytest
 import torch
+import torch.nn as nn
+import tiktoken
 
-sys.path.insert(0, ".")
 from gpt_with_kv_dsa import (
+    GPTModel,
     LightningIndexer,
     MultiHeadAttentionWithDSA,
-    GPTModel,
     generate_text_simple_cached,
 )
-import tiktoken
+
+
+def import_transformers_dsa_model():
+    """Import the reference DSA model from the installed Transformers package."""
+    try:
+        from transformers import GlmMoeDsaConfig, GlmMoeDsaModel
+    except ImportError as err:
+        pytest.skip(f"Transformers GLM-MoE-DSA reference unavailable: {err}")
+
+    return GlmMoeDsaConfig, GlmMoeDsaModel
 
 
 def test_output_shape():
@@ -29,7 +34,6 @@ def test_output_shape():
     x = torch.randn(b, T, d)
     out = attn(x)
     assert out.shape == (b, T, d), f"Wrong shape: {out.shape}"
-    print(f"Test 1 PASS  Output shape {tuple(out.shape)} is correct")
 
 
 def test_causal_property():
@@ -48,10 +52,7 @@ def test_causal_property():
     x_noisy[:, 6:, :] = torch.randn(b, T - 6, d)
     out_noisy = attn(x_noisy)
 
-    ok = torch.allclose(out_full[:, :6, :], out_noisy[:, :6, :], atol=1e-5)
-    status = "PASS" if ok else "FAIL"
-    print(f"Test 2 {status}  Causal: positions 0-5 unchanged when future tokens differ")
-    assert ok, "Causal property violated!"
+    torch.testing.assert_close(out_noisy[:, :6, :], out_full[:, :6, :], rtol=0, atol=1e-5)
 
 
 def test_sparsity():
@@ -78,11 +79,60 @@ def test_sparsity():
     combined = causal_float.unsqueeze(0) + sparse_mask   # (1, T, T)
     counts = (combined[0] > float("-inf")).sum(dim=-1).float()
 
-    ok = int(counts.max()) <= topk
-    status = "PASS" if ok else "FAIL"
-    print(f"Test 3 {status}  Sparsity: avg attended = {counts.mean():.1f}, "
-          f"max = {int(counts.max())} <= topk={topk}")
-    assert ok, f"A query attended more than topk={topk} tokens!"
+    assert int(counts.max()) <= topk
+
+
+@pytest.mark.skipif(
+    os.environ.get("GITHUB_ACTIONS") == "true",
+    reason="Transformers reference test is too expensive for GitHub Actions",
+)
+def test_indexer_matches_transformers_reference():
+    """The indexer must match the Transformers DSA scoring path."""
+    torch.manual_seed(4)
+    b, T, d = 2, 6, 32
+    topk = 3
+    indexer = LightningIndexer(d_model=d, index_n_heads=4, index_head_dim=8)
+    GlmMoeDsaConfig, GlmMoeDsaModel = import_transformers_dsa_model()
+    reference_cfg = GlmMoeDsaConfig(
+        vocab_size=128,
+        hidden_size=d,
+        intermediate_size=64,
+        moe_intermediate_size=16,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        kv_lora_rank=8,
+        index_n_heads=indexer.index_n_heads,
+        index_head_dim=indexer.index_head_dim,
+        index_topk=topk,
+        q_lora_rank=d,
+        qk_rope_head_dim=0,
+        qk_nope_head_dim=8,
+        v_head_dim=8,
+        n_routed_experts=4,
+        num_experts_per_tok=1,
+        max_position_embeddings=16,
+        mlp_layer_types=["dense"],
+    )
+    reference_model = GlmMoeDsaModel(reference_cfg)
+    reference_model.eval()
+    reference = reference_model.layers[0].self_attn.indexer
+    reference.k_norm = nn.Identity()
+    with torch.no_grad():
+        reference.wq_b.weight.copy_(indexer.W_q_index.weight)
+        reference.wk.weight.copy_(indexer.W_k_index.weight)
+        reference.weights_proj.weight.copy_(indexer.W_weights.weight)
+
+    x = torch.randn(b, T, d)
+    q_pos = torch.arange(T)
+    k_pos = torch.arange(T)
+    causal_bool = q_pos.unsqueeze(-1) < k_pos.unsqueeze(0)
+    causal_mask = torch.zeros(T, T).masked_fill_(causal_bool, float("-inf"))
+
+    actual = indexer(x, x, topk=topk, causal_mask=causal_mask)
+    empty_rope = torch.empty(b, T, 0)
+    expected = reference(x, x, (empty_rope, empty_rope), causal_mask)
+    assert torch.equal(actual, expected)
 
 
 def test_cache_consistency():
@@ -107,10 +157,25 @@ def test_cache_consistency():
     idx = torch.tensor(encoded).unsqueeze(0)
     out_no_cache = generate_text_simple_cached(model, idx.clone(), max_new_tokens=5, use_cache=False)
     out_with_cache = generate_text_simple_cached(model, idx.clone(), max_new_tokens=5, use_cache=True)
-    ok = torch.equal(out_no_cache, out_with_cache)
-    status = "PASS" if ok else "FAIL"
-    print(f"Test 4 {status}  Cached == non-cached: {ok}")
-    assert ok, "KV cache introduced different outputs!"
+    assert torch.equal(out_no_cache, out_with_cache)
+
+
+def dense_attention_reference(attn, x):
+    """Dense causal attention using the same projections as the DSA module."""
+    b, T, _ = x.shape
+
+    queries = attn.W_query(x).view(b, T, attn.num_heads, attn.head_dim).transpose(1, 2)
+    keys = attn.W_key(x).view(b, T, attn.num_heads, attn.head_dim).transpose(1, 2)
+    values = attn.W_value(x).view(b, T, attn.num_heads, attn.head_dim).transpose(1, 2)
+
+    attn_scores = queries @ keys.transpose(2, 3)
+    mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), diagonal=1)
+    attn_scores = attn_scores.masked_fill(mask, float("-inf"))
+
+    attn_weights = torch.softmax(attn_scores / attn.head_dim ** 0.5, dim=-1)
+    context_vec = attn_weights @ values
+    context_vec = context_vec.transpose(1, 2).contiguous().view(b, T, attn.d_out)
+    return attn.out_proj(context_vec)
 
 
 def test_topk_full_equals_dense():
@@ -118,32 +183,11 @@ def test_topk_full_equals_dense():
     torch.manual_seed(3)
     b, T, d = 1, 10, 64
 
-    def make_attn(topk):
-        a = MultiHeadAttentionWithDSA(
-            d_in=d, d_out=d, dropout=0.0, num_heads=4,
-            index_n_heads=2, index_head_dim=16, topk=topk,
-        )
-        # Use deterministic weights for fair comparison
-        torch.manual_seed(3)
-        return a
-
-    attn_dense = make_attn(topk=T)   # topk=seqlen => no sparsity
-    attn_full  = make_attn(topk=T)   # identical weights, same result expected
+    attn_full = MultiHeadAttentionWithDSA(
+        d_in=d, d_out=d, dropout=0.0, num_heads=4,
+        index_n_heads=2, index_head_dim=16, topk=T,
+    )
     x = torch.randn(b, T, d)
-    out1 = attn_dense(x)
-    out2 = attn_full(x)
-    ok = torch.allclose(out1, out2, atol=1e-5)
-    print(f"Test 5 PASS  topk >= seqlen produces identical outputs (dense baseline)")
-
-
-if __name__ == "__main__":
-    print("=" * 50)
-    print("  DeepSeek Sparse Attention (DSA) — Tests")
-    print("=" * 50)
-    test_output_shape()
-    test_causal_property()
-    test_sparsity()
-    test_cache_consistency()
-    test_topk_full_equals_dense()
-    print()
-    print("All tests passed.")
+    out_dsa = attn_full(x)
+    out_dense = dense_attention_reference(attn_full, x)
+    torch.testing.assert_close(out_dsa, out_dense, rtol=0, atol=1e-5)

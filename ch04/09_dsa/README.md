@@ -1,41 +1,69 @@
 # DeepSeek Sparse Attention (DSA)
 
-This bonus material implements the **DeepSeek Sparse Attention (DSA)** mechanism introduced in [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) and first published in the experimental [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) release.
+This bonus material implements the DeepSeek Sparse Attention (DSA) mechanism introduced in [DeepSeek-V3.2](https://huggingface.co/deepseek-ai/DeepSeek-V3.2) and first published in the experimental [DeepSeek-V3.2-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp) release.
+
+The overview below follows the DSA discussion in [From DeepSeek V3 to V3.2: Architecture, Sparse Attention, and RL Updates](https://magazine.sebastianraschka.com/p/technical-deepseek).
 
 &nbsp;
 ## Introduction
 
-Standard causal self-attention attends to **all** previous tokens for each query, yielding O(L²) compute and O(L) KV-cache growth with sequence length L.
+Standard causal self-attention attends to all previous tokens for each query, yielding O(L²) compute and O(L) KV-cache growth with sequence length L.
 
-[Sliding Window Attention (SWA)](../06_swa) already showed that restricting attention to a *fixed local window* substantially reduces this cost. DSA takes a different approach: instead of a fixed window, it **learns which past tokens are most relevant** for each query and attends only to those.
+[Sliding Window Attention (SWA)](../06_swa) already showed that restricting attention to a fixed local window substantially reduces this cost. In SWA, each query token attends only to a local span of nearby previous tokens.
+
+&nbsp;
+
+<img src="https://sebastianraschka.com/images/blog/2025/technical-deepseek/09.png" alt="Sliding window attention" width="800px" />
+
+*Figure 1. Sliding-window attention restricts each query token to a fixed local context window.*
+
+&nbsp;
+
+DSA uses the same broad idea of attending to only a subset of previous tokens. However, it replaces the fixed window with a learned selection mechanism. For each query token, the model scores candidate past tokens and keeps only the most relevant ones.
+
+&nbsp;
+
+<img src="https://sebastianraschka.com/images/blog/2025/technical-deepseek/10.png" alt="DeepSeek Sparse Attention selected-token pattern" width="800px" />
+
+*Figure 2. DeepSeek Sparse Attention selects a learned subset of past tokens for each query token.*
+
+&nbsp;
 
 ### Architecture overview
 
-DSA adds two components on top of standard attention:
+DSA adds two components on top of standard attention.
 
 **1. Lightning Indexer**
 
-For each query token t and every candidate past token s, the indexer computes a scalar relevance score
+For each query token $t$ and every candidate past token $s$, the indexer computes a scalar relevance score. This implementation makes the scale factors from the reference code explicit:
 
-$$I_{t,s} = \sum_{j=1}^{H_I} w_{t,j} \cdot \text{ReLU}(q_{t,j} \cdot k_s)$$
+$$I_{t,s} = \sum_{j=1}^{H_I} \frac{w_{t,j}}{\sqrt{H_I}} \cdot \text{ReLU}\left(\frac{q_{t,j} \cdot k_s}{\sqrt{d_I}}\right)$$
 
 where:
 - $H_I$ is the number of lightweight index heads,
 - $q_{t,j}$ is the indexer query vector for token $t$ and head $j$,
 - $k_s$ is a shared indexer key vector for past token $s$,
-- $w_{t,j}$ is a learned per-head weight (normalised over heads at query time).
+- $w_{t,j}$ is a learned per-head gate scaled by $1 / \sqrt{H_I}$.
 
-The ReLU zeroes out negative dot-product contributions, and the weighted sum aggregates across index heads into a single relevance score per past token.
+The ReLU zeroes out negative dot-product contributions, and the gated sum aggregates across index heads into a single relevance score per past token.
+
+In the full DeepSeek model, the indexer works with the compressed token representations from Multi-Head Latent Attention (MLA). This folder keeps the GPT implementation simpler and computes the indexer queries and keys from the regular hidden states.
 
 **2. Token Selector**
 
-After computing all indexer scores, only the **top-K** highest-scoring positions are kept. All other positions are masked to −∞ *before* the standard softmax, so the model effectively attends to only $k \ll L$ tokens.
+After computing all indexer scores, only the top-K highest-scoring positions are kept. All other positions are masked to −∞ *before* the standard softmax, so the model effectively attends to only $k \ll L$ tokens.
 
-This lowers the effective attention complexity from O(L²) to O(L·k).
+The ReLU in the indexer is not where the final sparsity comes from. Since the scores are summed over multiple index heads, most final scores can still be nonzero. The token selector creates the sparse pattern by keeping only the top-K positions.
 
-The figure below illustrates the process (taken from Sebastian Raschka's blog post [From DeepSeek V3 to V3.2](https://magazine.sebastianraschka.com/p/technical-deepseek)):
+In a fused production implementation, this can lower attention compute from O(L²) to O(L·k). The implementation here keeps the standard dense attention score matrix and applies the DSA-selected top-K mask before softmax. This makes the selection logic easy to inspect, but it does not provide the fused-kernel compute savings.
 
-> In DSA, the current token can attend a select number of tokens in the past (instead of all tokens like in regular causal attention).
+The figure below summarizes the flow. The lightning indexer scores candidate tokens, the selector keeps top-K positions, and the resulting mask restricts the usual attention softmax.
+
+&nbsp;
+
+<img src="https://sebastianraschka.com/images/blog/2025/technical-deepseek/11.png" alt="DeepSeek Sparse Attention flowchart" width="700px" />
+
+*Figure 3. DSA first scores candidate tokens, then keeps the top-K tokens for the final attention mask.*
 
 &nbsp;
 ## Implementation
@@ -48,7 +76,7 @@ The figure below illustrates the process (taken from Sebastian Raschka's blog po
 | `MultiHeadAttentionWithDSA` | Standard MHA with DSA sparse masking + optional KV cache. |
 | `GPTModel` | GPT-style model swapping in `MultiHeadAttentionWithDSA`. |
 
-The implementation follows the style of the other bonus material in this repository and can be run as a standalone script.
+The implementation follows the style of the other bonus material in this repository and can be run as a standalone script. It is meant to make the DSA mechanism inspectable in a small GPT-style model. It does not implement DeepSeek's full MLA stack, fused sparse kernels, or deployment-specific optimizations.
 
 &nbsp;
 ## Usage
@@ -75,13 +103,21 @@ Key arguments:
 &nbsp;
 ## Relation to DeepSeek V3.2
 
-The full-scale DeepSeek-V3.2 model also uses Multi-Head Latent Attention (MLA, see [../05_mla](../05_mla)) alongside DSA, and the indexer queries are derived from the shared compressed latent representation rather than the raw input. This implementation uses standard multi-head projections for clarity and compatibility with the rest of the repository.
+The full-scale DeepSeek-V3.2 model uses Multi-Head Latent Attention (MLA, see [../05_mla](../05_mla)) alongside DSA, and the indexer queries are derived from the shared compressed latent representation rather than the raw input. DeepSeek-V3.2 uses the same architecture as DeepSeek-V3.2-Exp, where DSA was first introduced and tested.
 
-The key insight—using a cheap, learned dot-product scorer to limit the attention span to the most relevant tokens—is faithfully reproduced here.
+The key selection idea is reproduced here. A cheap learned dot-product scorer limits each query to the most relevant tokens before the attention softmax.
+
+The reported inference-cost comparison below is useful context for why DSA matters in long-context deployments. The savings depend on production kernels and serving infrastructure, so this figure should not be read as a benchmark for the teaching implementation in this folder.
+
+&nbsp;
+
+<img src="https://sebastianraschka.com/images/blog/2025/technical-deepseek/19.png" alt="Inference cost comparison for DeepSeek Sparse Attention" width="800px" />
+
+*Figure 4. DeepSeek's reported inference-cost savings from DSA in long-context serving, from the [DeepSeek V3.2 technical report](https://huggingface.co/deepseek-ai/DeepSeek-V3.2/resolve/main/assets/paper.pdf).*
 
 &nbsp;
 ## References
 
 - DeepSeek V3.2 technical report: https://huggingface.co/deepseek-ai/DeepSeek-V3.2/resolve/main/assets/paper.pdf
 - DeepSeek V3.2-Exp model card & reference code: https://huggingface.co/deepseek-ai/DeepSeek-V3.2-Exp
-- Sebastian Raschka's overview: https://magazine.sebastianraschka.com/p/technical-deepseek
+- Sebastian Raschka's "From DeepSeek V3 to V3.2: Architecture, Sparse Attention, and RL Updates": https://magazine.sebastianraschka.com/p/technical-deepseek
