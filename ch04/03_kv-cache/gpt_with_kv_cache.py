@@ -38,7 +38,7 @@ class MultiHeadAttention(nn.Module):
         self.ptr_current_pos = 0
         ####################################################
 
-    def forward(self, x, use_cache=False):
+    def forward(self, x: torch.Tensor, use_cache=False):
         b, num_tokens, d_in = x.shape
 
         keys_new = self.W_key(x)  # Shape: (b, num_tokens, d_out)
@@ -59,24 +59,34 @@ class MultiHeadAttention(nn.Module):
             else:
                 self.cache_k = torch.cat([self.cache_k, keys_new], dim=1)
                 self.cache_v = torch.cat([self.cache_v, values_new], dim=1)
+            # shape: (b, num_tokens+ Pre_num_tokens, num_heads, head_dim)
             keys, values = self.cache_k, self.cache_v
         else:
             keys, values = keys_new, values_new
         ####################################################
 
         # Transpose: (b, num_tokens, num_heads, head_dim) -> (b, num_heads, num_tokens, head_dim)
-        keys = keys.transpose(1, 2)
         queries = queries.transpose(1, 2)
+        # if use cache: keys, values shape: (b, num_heads, num_tokens + pre_num_tokens, head_dim)
+        keys = keys.transpose(1, 2)
         values = values.transpose(1, 2)
 
         # Compute scaled dot-product attention (aka self-attention) with a causal mask
+        # shape: (b, num_heads, num_tokens, num_tokens)
+        # if use chache:
+        #    shape: (b, num_heads, num_tokens, num_tokens + pre_num_tokens)
         attn_scores = queries @ keys.transpose(2, 3)  # Dot product for each head
 
         ####################################################
         # NEW
-        num_tokens_Q = queries.shape[-2]
-        num_tokens_K = keys.shape[-2]
+        num_tokens_Q = queries.shape[-2] # num_tokens
+        num_tokens_K = keys.shape[-2] # num_toekns + pre_num_tokens
         if use_cache:
+            """
+            刚开始阅读这里，对 num_tokens_Q 理解错了，这是Q，进包含当前的 x的长度
+
+            """
+            # shape: (num_tokens, num_tokens + pre_num_tokens)
             mask_bool = self.mask.bool()[
                 self.ptr_current_pos:self.ptr_current_pos + num_tokens_Q, :num_tokens_K
             ]
@@ -92,11 +102,23 @@ class MultiHeadAttention(nn.Module):
         attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
         attn_weights = self.dropout(attn_weights)
 
+        # (b, num_heads, num_tokens, num_tokens) * (b, num_heads, num_tokens, head_dim) -> (b, num_heads, num_tokens, head_dim)
+        # -> Transpose: (b, num_tokens, num_heads, head_dim)
         # Shape: (b, num_tokens, num_heads, head_dim)
+        """
+        attn_scores: (b, num_heads, num_tokens, num_tokens + pre_num_tokens)
+        values: (b, num_heads, num_tokens + pre_num_tokens, head_dim)
+        context_vec: (b, num_heads, num_tokens, head_dim) -- Transpose: (b, num_tokens, num_heads, head_dim) (因为多头注意力)
+        """
         context_vec = (attn_weights @ values).transpose(1, 2)
 
         # Combine heads, where self.d_out = self.num_heads * self.head_dim
+        # -> (b, num_tokens, d_out)
+        # if use_cache: shape: (b, num_tokens, d_out)
+        # else: shape: (b, num_tokens, d_out)
         context_vec = context_vec.contiguous().view(b, num_tokens, self.d_out)
+        # if use_cache: shape: (b, num_tokens, d_out)
+        # else: shape: (b, num_tokens, d_out)
         context_vec = self.out_proj(context_vec)  # optional projection
 
         return context_vec
@@ -127,6 +149,22 @@ class LayerNorm(nn.Module):
 
 
 class GELU(nn.Module):
+    """
+    Gaussian Error Linear Unit (GELU) 激活函数实现。
+
+    参考论文:
+    - Hendrycks, D., & Gimpel, K. (2016). "Gaussian Error Linear Units (GELUs)". arXiv preprint arXiv:1606.08415.
+      https://arxiv.org/abs/1606.08415
+
+    近似计算原理:
+    本实现采用论文中的近似公式：
+        GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x^3)))
+    其依据如下：
+    - 该近似推导及理论基础见上述论文第3节 (“Approximation”)，提出了对 erf 的近似以简化实际计算，同时保留激活函数的平滑性与非线性特征。
+    - 该近似在 transformer 等大规模神经网络中广泛用于提升表达能力和训练稳定性。
+
+    直接引用自原论文公式(Equation 4)。
+    """
     def __init__(self):
         super().__init__()
 
@@ -318,7 +356,7 @@ def main():
 
     torch.manual_seed(123)
     model = GPTModel(GPT_CONFIG_124M)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu")
     model.to(device)
     model.eval()  # disable dropout
 
